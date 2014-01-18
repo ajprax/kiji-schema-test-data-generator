@@ -1,8 +1,14 @@
 package org.kiji.schema
 
+import org.apache.avro.Schema
+import org.apache.avro.generic.{GenericRecordBuilder, GenericRecord}
 import org.apache.commons.lang3.RandomStringUtils
 import org.apache.commons.math3.random.RandomDataGenerator
-
+import org.apache.avro.specific.{SpecificRecordBuilderBase, SpecificRecord}
+import java.lang.reflect.AccessibleObject
+import java.nio.ByteBuffer
+import com.google.gson.{JsonElement, JsonObject, JsonParser, Gson}
+import org.apache.avro.data.RecordBuilderBase
 
 trait Generator[T] {
   def next: T
@@ -127,12 +133,12 @@ object DoubleGenerator {
 
 // -------------------------------------------------------------------------------------------------
 
-class BytesGenerator(mode: BytesGenerator.Mode) extends Generator[Array[Byte]] {
+class BytesGenerator(mode: BytesGenerator.Mode) extends Generator[ByteBuffer] {
   private val rand: RandomDataGenerator = new RandomDataGenerator()
-  private val generate: () => Array[Byte] = mode match {
-    case BytesGenerator.Length(length) => () => rand.nextPermutation(256, length).map { _.toByte }
+  private val generate: () => ByteBuffer = mode match {
+    case BytesGenerator.Length(length) => () => ByteBuffer.wrap(rand.nextPermutation(256, length).map { _.toByte })
   }
-  def next: Array[Byte] = generate()
+  def next: ByteBuffer = generate()
 }
 
 object BytesGenerator {
@@ -183,18 +189,92 @@ object MapGenerator {
 
 // -------------------------------------------------------------------------------------------------
 
-class EnumGenerator(mode: EnumGenerator.Mode) extends Generator[String] {
+class EnumGenerator[T <: Enum[T]](mode: EnumGenerator.Mode) extends Generator[T] {
   private val rand: RandomDataGenerator = new RandomDataGenerator()
-  private val generate: () => String = mode match {
+  private val generate: () => T = mode match {
     case EnumGenerator.Enumerated(values) => () => {
-      val ordered: List[String] = values.toList
-      ordered(rand.nextInt(0, values.size - 1))
+      values.apply(rand.nextInt(0, values.size - 1)).asInstanceOf[T]
     }
   }
-  def next: String = generate()
+  def next: T = generate()
 }
 
 object EnumGenerator {
   sealed trait Mode
-  case class Enumerated(values: Set[String]) extends Mode
+  case class Enumerated[T <: Enum[T]](enum: Array[T]) extends Mode
+}
+
+// -------------------------------------------------------------------------------------------------
+
+class FixedGenerator(mode: FixedGenerator.Mode) extends Generator[Array[Byte]] {
+  private val rand: RandomDataGenerator = new RandomDataGenerator()
+  private val generate: () => Array[Byte] = mode match {
+    case FixedGenerator.Length(length) => () => rand.nextPermutation(256, length).map { _.toByte }
+  }
+  def next: Array[Byte] = generate()
+}
+
+object FixedGenerator {
+  sealed trait Mode
+  case class Length(length: Int) extends Mode
+}
+
+// -------------------------------------------------------------------------------------------------
+
+class GenericRecordGenerator(mode: GenericRecordGenerator.Mode) extends Generator[GenericRecord] {
+  private val generate: () => GenericRecord = mode match {
+    case GenericRecordGenerator.Generic(schema, fields) => () => {
+      val builder = new GenericRecordBuilder(schema)
+      fields.foreach { pair: (String, Generator[_]) => builder.set(pair._1, pair._2.next)}
+      builder.build()
+    }
+  }
+  def next: GenericRecord = generate()
+}
+
+object GenericRecordGenerator {
+  sealed trait Mode
+  case class Generic(schema: Schema, fields: Map[String, Generator[_]]) extends Mode
+}
+
+class SpecificRecordGenerator[T <: SpecificRecord](
+    mode: SpecificRecordGenerator.Mode
+) extends Generator[T] {
+  private val generate: () => T = mode match {
+    case SpecificRecordGenerator.Specific(clazz, fields) => () => {
+      val builder = clazz.getMethod("newBuilder").invoke(null)
+      val fieldsMap = SpecificRecordGenerator.getFieldsFromSpecificRecordClass(clazz)
+      fields.foreach { pair: (String, Generator[_]) => {
+        val isFieldSetField = classOf[RecordBuilderBase[clazz.type]].getDeclaredField("fieldSetFlags")
+        isFieldSetField.setAccessible(true)
+        val field = builder.getClass.getDeclaredField(pair._1)
+        field.setAccessible(true)
+        field.set(builder, pair._2.next)
+        val oldIsFieldSetField = isFieldSetField.get(builder).asInstanceOf[Array[Boolean]]
+        oldIsFieldSetField(fieldsMap(pair._1)) = true
+      }}
+      builder.getClass.getFields.foreach(println)
+      builder.asInstanceOf[SpecificRecordBuilderBase[T]].build
+    }
+  }
+  def next: T = generate()
+}
+
+object SpecificRecordGenerator {
+  sealed trait Mode
+  case class Specific[T <: SpecificRecord](
+      clazz: Class[T], fields: Map[String, Generator[_]]
+  ) extends Mode
+
+  def getFieldsFromSpecificRecordClass[T <: SpecificRecord](clazz: Class[T]): Map[String, Int] = {
+    val schema = clazz.getMethod("getClassSchema").invoke(null).toString
+    val obj = new JsonParser().parse(schema).asInstanceOf[JsonObject]
+    import scala.collection.JavaConverters.asScalaSetConverter
+    import scala.collection.JavaConverters.asScalaIteratorConverter
+    import java.util.{Map => JMap}
+    val jsonFields = obj.entrySet().asScala.map { (entry: JMap.Entry[String, JsonElement]) => (entry.getKey, entry.getValue)}.toMap.get("fields")
+    val jsonFieldsArray = jsonFields.get.getAsJsonArray
+    var i = -1
+    jsonFieldsArray.iterator().asScala.map { (elem: JsonElement) => (elem.getAsJsonObject.get("name").getAsString, {i += 1; i})}.toMap
+  }
 }
